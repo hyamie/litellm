@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from litellm_proxy_extras._logging import logger
+from litellm_proxy_extras._redaction import _redact_credentials
 from litellm_proxy_extras.prisma_toolchain import (
     MIGRATION_LOCK_TIMEOUT_ENV_VAR,
     migration_lock_timeout,
@@ -49,6 +50,23 @@ def _try_lock(connection: "psycopg.Connection[tuple[object, ...]]", key: int = M
     return row is not None and row.acquired
 
 
+def _coordination_failure(database_url: str, exc: "psycopg.Error", *, connecting: bool) -> str:
+    import psycopg
+
+    prefix: Final = "Lost or could not establish v2 migration coordination with the database: "
+    raw: Final = str(exc)
+    detail: Final = _redact_credentials(raw).strip()
+    if not connecting or not isinstance(exc, psycopg.OperationalError) or "FATAL:" in raw:
+        return prefix + detail
+    parsed_url: Final = urlsplit(database_url)
+    try:
+        port: Final = parsed_url.port
+    except ValueError:
+        return prefix + f"P1001: Can't reach database server. {detail}"
+    host: Final = parsed_url.hostname or "localhost"
+    return prefix + f"P1001: Can't reach database server at `{host}:{port or 5432}`. {detail}"
+
+
 @dataclass(frozen=True, slots=True)
 class MigrationCoordinator:
     connection: "psycopg.Connection[tuple[object, ...]]"
@@ -81,7 +99,11 @@ def migration_lock(database_url: str) -> Generator[MigrationCoordinator, None, N
     wait_seconds: Final = migration_lock_timeout()
     deadline: Final = time.monotonic() + wait_seconds
     try:
-        with psycopg.connect(database_url, connect_timeout=10, autocommit=True) as connection:
+        connection: Final = psycopg.connect(database_url, connect_timeout=10, autocommit=True)
+    except psycopg.Error as exc:
+        raise RuntimeError(_coordination_failure(database_url, exc, connecting=True)) from None
+    try:
+        with connection:
             coordinator: Final = MigrationCoordinator(connection)
             logger.info("Waiting for the v2 migration coordinator lock (up to %ss)", wait_seconds)
             while time.monotonic() < deadline:
@@ -94,7 +116,7 @@ def migration_lock(database_url: str) -> Generator[MigrationCoordinator, None, N
                         return
                 time.sleep(min(random.uniform(0.5, 1.5), max(0.0, deadline - time.monotonic())))
     except psycopg.Error as exc:
-        raise RuntimeError(f"Lost or could not establish v2 migration coordination with the database: {exc}") from exc
+        raise RuntimeError(_coordination_failure(database_url, exc, connecting=False)) from None
     raise RuntimeError(
         f"Timed out waiting for another v2 migration resolver after {wait_seconds}s. "
         f"Check the running migration or increase {MIGRATION_LOCK_TIMEOUT_ENV_VAR}."

@@ -36,6 +36,25 @@ _MIGRATIONS_DIR = os.path.abspath(
 )
 
 
+def test_coordination_failure_does_not_misclassify_fatal_password_as_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import psycopg
+    from litellm_proxy_extras.migration_lock import _coordination_failure
+
+    database_url: Final = "postgresql://u:FATAL@127.0.0.1:5432/db"
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    error: Final = psycopg.OperationalError(
+        'connection failed: connection to server at "127.0.0.1", port 5432 failed: '
+        'FATAL:  password authentication failed for user "u"'
+    )
+
+    result: Final = _coordination_failure(database_url, error, connecting=True)
+
+    assert result.startswith("Lost or could not establish v2 migration coordination with the database: ")
+    assert "P1001" not in result
+
+
 def test_custom_prisma_dir(monkeypatch):
     import tempfile
 
@@ -681,8 +700,11 @@ class TestLensRenamePendingCheck:
         with pytest.raises(psycopg.Error) as libpq:
             psycopg.connect(database_url, connect_timeout=10, autocommit=True)
 
+        def raise_libpq_error(conninfo: str, *, connect_timeout: int, autocommit: bool) -> NoReturn:
+            raise libpq.value
+
         with pytest.raises(RuntimeError) as err:
-            ProxyExtrasDBManager.raise_if_lens_rename_pending()
+            ProxyExtrasDBManager.raise_if_lens_rename_pending(connect=raise_libpq_error)
         assert password not in str(err.value)
         assert str(err.value).endswith(str(libpq.value).strip().replace(password, "REDACTED"))
 
@@ -1462,6 +1484,78 @@ class TestStripPrismaQueryParams:
         from urllib.parse import parse_qsl, urlparse
 
         return dict(parse_qsl(urlparse(url).query))
+
+    @pytest.mark.parametrize(
+        "url,expected_user,expected_password,expected_host,expected_port,expected_sslmode",
+        (
+            (
+                "postgresql://u:wr ong'pw9@writer:5433/litellm",
+                "u",
+                "wr ong'pw9",
+                "writer",
+                "5433",
+                None,
+            ),
+            (
+                "postgresql://u:wr ong'pw9@writer:5433/litellm?schema=x&sslmode=require",
+                "u",
+                "wr ong'pw9",
+                "writer",
+                "5433",
+                "require",
+            ),
+            (
+                "postgresql://u:p%40ss%20w@writer:5433/litellm",
+                "u",
+                "p@ss w",
+                "writer",
+                "5433",
+                None,
+            ),
+            (
+                "postgresql://u:p%z@writer:5433/litellm",
+                "u",
+                "p%z",
+                "writer",
+                "5433",
+                None,
+            ),
+            (
+                "postgresql://u:wr ong'pw9@[::1]:5433/litellm",
+                "u",
+                "wr ong'pw9",
+                "::1",
+                "5433",
+                None,
+            ),
+        ),
+    )
+    def test_userinfo_is_encoded_for_libpq(
+        self,
+        url: str,
+        expected_user: str,
+        expected_password: str,
+        expected_host: str,
+        expected_port: str,
+        expected_sslmode: str | None,
+    ) -> None:
+        from psycopg.conninfo import conninfo_to_dict
+
+        result: Final = ProxyExtrasDBManager._strip_prisma_query_params(url)
+        conninfo: Final = conninfo_to_dict(result)
+
+        assert conninfo["user"] == expected_user
+        assert conninfo["password"] == expected_password
+        assert conninfo["host"] == expected_host
+        assert conninfo["port"] == expected_port
+        assert conninfo["dbname"] == "litellm"
+        assert conninfo.get("sslmode") == expected_sslmode
+        assert "schema" not in conninfo
+
+    def test_empty_password_userinfo_keeps_its_separator(self) -> None:
+        url: Final = "postgresql://u:@writer/litellm"
+
+        assert ProxyExtrasDBManager._strip_prisma_query_params(url) == url
 
     def test_prisma_ca_sslcert_becomes_sslrootcert_with_verify_full(self):
         url = "postgresql://u:p@writer:5432/db?schema=public&sslmode=require&sslcert=/tmp/pinned.pem&sslaccept=strict"
